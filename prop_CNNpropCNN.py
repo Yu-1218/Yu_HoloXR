@@ -12,6 +12,126 @@ from prop_submodules import Field2Input, Output2Field, Conv2dField,\
 from prop_zernike import compute_zernike_basis, combine_zernike_basis
 
 
+class PropModel(pl.LightningModule):
+    """
+    A parameterized model trained on captured images at multiple planes
+
+    Class initialization parameters
+    -------------------------------
+    :param roi_res:
+    :param plane_idxs:
+    :param loss_func:
+    :param lr:
+    """
+
+    def __init__(self, roi_res=(1080, 1920), plane_idxs=None, loss_func=F.l1_loss, lr=4e-4):
+        super(PropModel, self).__init__()
+        self.roi_res = roi_res
+        self.plane_idxs = plane_idxs
+        self.loss_func = loss_func
+        self.lr = lr
+        self.recon_amp = {}
+        self.target_amp = {}
+
+    def perform_step(self, batch, batch_idx, prefix):
+        slm_phase, target_amps = batch
+
+        # output field at target planes.
+        recon_fields = self.forward(slm_phase)
+
+        # calculate losses
+        loss, loss_mse, loss_mse_all = self.mp_loss(recon_fields, target_amps,
+                                                    self.plane_idxs, self.loss_func, prefix)
+
+        with torch.no_grad():
+            self.log(f'loss_{prefix}', loss, on_step=True, on_epoch=True)
+            self.log(f'PSNR_{prefix}', 10*math.log10(1 /
+                     loss_mse), on_step=True, on_epoch=True)
+            self.log(f'PSNR_except_held_out_{prefix}',
+                     10*math.log10(1/loss_mse_all), on_step=True, on_epoch=True)
+
+        return loss
+
+    def mp_loss(self, recon_fields, target_amps, plane_idxs, loss_func, prefix):
+        """ Loss function on multiplane amplitudes"""
+
+        # take the amplitudes.
+        target_amps = utils.crop_image(
+            target_amps, self.roi_res, stacked_complex=False)
+        recon_amps = utils.crop_image(
+            recon_fields, self.roi_res, stacked_complex=False).abs()
+
+        with torch.no_grad():
+            self.recon_amp[prefix] = recon_amps
+            self.target_amp[prefix] = target_amps
+
+        # calculate loss values.
+        loss = 0.  # the loss you penalize.
+        mse_loss = 0.  # PSNR on planes you penalize.
+        mse_loss_all = 0.  # PSNR on all planes except the held-out plane.
+
+        if plane_idxs is None:
+            # penalize all planes
+            loss += loss_func(recon_amps, target_amps)
+        else:
+            # penalize only selected planes
+            for i in range(target_amps.shape[1]):
+                if i in plane_idxs[prefix]:
+                    # selected planes
+                    loss_i = loss_func(
+                        recon_amps[:, i, ...], target_amps[:, i, ...])
+                    loss += loss_i / len(plane_idxs[prefix])
+                else:
+                    # these are not penalized, just for tensorboard
+                    with torch.no_grad():
+                        loss_i = loss_func(
+                            recon_amps[:, i, ...], target_amps[:, i, ...])
+
+                # report PSNR
+                with torch.no_grad():
+                    # this is for evaluation so just use the min-mse scaling.
+                    s = (recon_amps[:, i, ...] * target_amps[:, i, ...]).mean() \
+                        / (recon_amps[:, i, ...]**2).mean()
+                    mse_loss_i = F.mse_loss(
+                        s*recon_amps[:, i, ...], target_amps[:, i, ...])
+
+                    if i in self.plane_idxs[prefix]:
+                        mse_loss += mse_loss_i / len(plane_idxs[prefix])
+
+                    if not i in self.plane_idxs['heldout']:
+                        # exclude held-out plane
+                        mse_loss_all += mse_loss_i / len(plane_idxs['train'])
+
+                    self.log(f'loss_{prefix}/plane_{i}',
+                             loss_i, on_step=True, on_epoch=True)
+                    self.log(f'PSNR_{prefix}/plane_{i}',
+                             10*math.log10(1./mse_loss_i), on_step=True, on_epoch=True)
+
+        return loss, mse_loss, mse_loss_all
+
+    def training_step(self, batch, batch_idx):
+        return self.perform_step(batch, batch_idx, 'train')
+
+    def validation_step(self, batch, batch_idx):
+        return self.perform_step(batch, batch_idx, 'validation')
+
+    def test_step(self, batch, batch_idx):
+        return self.perform_step(batch, batch_idx, 'test')
+
+    def test_epoch_end(self, outputs) -> None:
+        self.epoch_end_images('test')
+
+    def training_epoch_end(self, outputs) -> None:
+        self.epoch_end_images('train')
+
+    def validation_epoch_end(self, outputs) -> None:
+        self.epoch_end_images('validation')
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+        return optimizer
+
+
 class CNNpropCNN(PropModel):
     """
     A parameterized model with CNNs
